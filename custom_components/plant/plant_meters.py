@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 from homeassistant.components.integration.const import METHOD_TRAPEZOIDAL
@@ -10,10 +10,9 @@ from homeassistant.components.integration.sensor import IntegrationSensor
 from homeassistant.components.sensor import (
     RestoreSensor,
     SensorDeviceClass,
+    SensorEntity,
     SensorStateClass,
 )
-from homeassistant.components.utility_meter.const import DAILY
-from homeassistant.components.utility_meter.sensor import UtilityMeterSensor
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_NAME,
@@ -363,30 +362,117 @@ class PlantTotalLightIntegral(IntegrationSensor):
         return self._unit_of_measurement
 
 
-class PlantDailyLightIntegral(UtilityMeterSensor):
-    """Entity class to calculate Daily Light Integral from PPDF"""
+class PlantDailyLightIntegral(SensorEntity):
+    """Entity class to calculate Daily Light Integral from PPDF as a sliding 24-hour window"""
 
     def __init__(
         self,
         hass: HomeAssistant,
         config: ConfigEntry,
         illuminance_integration_sensor: Entity,
+        plantdevice: Entity,
     ) -> None:
         """Initialize the sensor"""
-        super().__init__(
-            cron_pattern=None,
-            delta_values=None,
-            meter_offset=timedelta(seconds=0),
-            meter_type=DAILY,
-            name=f"{config.data[FLOW_PLANT_INFO][ATTR_NAME]} {READING_DLI}",
-            net_consumption=None,
-            parent_meter=config.entry_id,
-            source_entity=illuminance_integration_sensor.entity_id,
-            tariff_entity=None,
-            tariff=None,
-            unique_id=f"{config.entry_id}-dli",
-            sensor_always_available=True,
-            suggested_entity_id=None,
+        self._attr_name = f"{config.data[FLOW_PLANT_INFO][ATTR_NAME]} {READING_DLI}"
+        self._attr_unique_id = f"{config.entry_id}-dli"
+        self.entity_id = async_generate_entity_id(
+            f"{DOMAIN}.{{}}", self.name, current_ids={}
         )
+        
+        self._hass = hass
+        self._config = config
+        self._plant = plantdevice
+        self._source_entity = illuminance_integration_sensor.entity_id
+        self._attr_native_unit_of_measurement = UNIT_DLI
+        self._attr_icon = "mdi:white-balance-sunny"
+        self._attr_state_class = SensorStateClass.MEASUREMENT
+        
+        # Store the last 24 hours of data points (timestamp, value)
+        self._data_points = []
+        self._last_value = 0
+        self._attr_native_value = 0
 
-        self._unit_of_measurement = UNIT_DLI
+    @property
+    def device_info(self) -> dict:
+        """Device info for devices"""
+        return {
+            "identifiers": {(DOMAIN, self._plant.unique_id)},
+        }
+        
+    async def async_added_to_hass(self) -> None:
+        """Handle entity which will be added."""
+        await super().async_added_to_hass()
+        
+        # Restore previous state if available
+        state = await self.async_get_last_state()
+        if state and state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            try:
+                self._attr_native_value = float(state.state)
+            except (ValueError, TypeError):
+                self._attr_native_value = 0
+                
+        # Track the source entity
+        async_track_state_change_event(
+            self._hass,
+            [self._source_entity],
+            self._source_changed,
+        )
+        
+        # Schedule regular updates to maintain the sliding window
+        from homeassistant.helpers.event import async_track_time_interval
+        self.async_on_remove(
+            async_track_time_interval(
+                self._hass,
+                self._update_sliding_window,
+                timedelta(minutes=5)  # Update every 5 minutes
+            )
+        )
+        
+    @callback
+    def _source_changed(self, event):
+        """Handle source entity state changes."""
+        if not event.data.get("new_state"):
+            return
+            
+        try:
+            new_value = float(event.data["new_state"].state)
+            old_value = 0
+            if event.data.get("old_state") and event.data["old_state"].state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                try:
+                    old_value = float(event.data["old_state"].state)
+                except (ValueError, TypeError):
+                    pass
+                    
+            # Calculate the increment since last update
+            increment = new_value - old_value
+            if increment > 0:
+                now = datetime.now()
+                self._data_points.append((now, increment))
+                self._update_value()
+                
+        except (ValueError, TypeError):
+            pass
+            
+    @callback
+    def _update_sliding_window(self, _now=None):
+        """Update the sliding window by removing data points older than 24 hours."""
+        if not self._data_points:
+            return
+            
+        now = datetime.now()
+        cutoff = now - timedelta(hours=24)
+        
+        # Remove data points older than 24 hours
+        self._data_points = [dp for dp in self._data_points if dp[0] >= cutoff]
+        self._update_value()
+        
+    def _update_value(self):
+        """Update the sensor value based on the current data points."""
+        if not self._data_points:
+            self._attr_native_value = 0
+        else:
+            # Sum all increments in the sliding window
+            total = sum(value for _, value in self._data_points)
+            self._attr_native_value = round(total, 2)
+            
+        self.async_write_ha_state()
